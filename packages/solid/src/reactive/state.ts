@@ -146,29 +146,72 @@ const proxyTraps: ProxyHandler<StateNode> = {
   getOwnPropertyDescriptor: proxyDescriptor
 };
 
-export function setProperty(state: StateNode, property: string | number, value: any) {
-  if (state[property] === value) return;
-  const notify = Array.isArray(state) || !(property in state);
+export function setProperty(
+  target: StateNode,
+  property: string | number,
+  value: any,
+  traversedPath?: (string | number)[],
+  traversedTargets?: any[],
+  notifiers?: StateChangedEventHandler[]
+) {
+  const oldValue = target[property];
+  if (oldValue === value) return;
+  const notify = Array.isArray(target) || !(property in target);
   if (value === undefined) {
-    delete state[property];
-  } else state[property] = value;
-  let nodes = getDataNodes(state),
+    delete target[property];
+  } else {
+    target[property] = value;
+  }
+  let nodes = getDataNodes(target),
     node;
   (node = nodes[property]) && node.set();
   notify && (node = nodes._) && node.set();
-}
-
-function mergeState(state: StateNode, value: Partial<StateNode>) {
-  const keys = Object.keys(value);
-  for (let i = 0; i < keys.length; i += 1) {
-    const key = keys[i];
-    setProperty(state, key, value[key]);
+  if (traversedPath && traversedTargets && notifiers) {
+    if (Array.isArray(target[property])) {
+      let eventArgs = {} as CollectionChangedEventArgs;
+      if (oldValue.length < target[property].length) {
+        eventArgs.action = "Add";
+        eventArgs.newItems = target[property].slice(oldValue.length, target[property].length);
+        eventArgs.newStartingIndex = oldValue.length;
+      } else if (oldValue.length > target[property].length) {
+        eventArgs.action = "Remove";
+        eventArgs.oldItems = oldValue.slice(target[property].length, oldValue.length);
+        eventArgs.oldStartingIndex = target[property].length;
+      } else {
+        eventArgs.action = "Replace";
+        eventArgs.oldItems = [];
+        eventArgs.newItems = [];
+        for (let i = 0; i < target[property].length; i++) {
+          if (target[property][i] !== oldValue[i]) {
+            eventArgs.oldItems.push(oldValue[i]);
+            eventArgs.newItems.push(target[property][i]);
+          }
+        }
+      }
+      notifiers.forEach(notifier =>
+        notifier(traversedPath, traversedTargets, "Collection", eventArgs)
+      );
+    } else {
+      notifiers.forEach(notifier =>
+        notifier(traversedPath, traversedTargets, "Property", {
+          oldValue,
+          newValue: value
+        })
+      );
+    }
   }
 }
 
-export function updatePath(current: StateNode, path: any[], traversed: (number | string)[] = []) {
-  let part,
+export function updatePath(
+  current: StateNode,
+  path: any[],
+  traversedPath: (number | string)[] = [],
+  traversedTargets: object[] = [],
+  notifiers?: StateChangedEventHandler[]
+) {
+  let part: any,
     prev = current;
+  if (!notifiers && Notifiers.has(current)) notifiers = Notifiers.get(current);
   if (path.length > 1) {
     part = path.shift();
     const partType = typeof part,
@@ -177,42 +220,117 @@ export function updatePath(current: StateNode, path: any[], traversed: (number |
     if (Array.isArray(part)) {
       // Ex. update('data', [2, 23], 'label', l => l + ' !!!');
       for (let i = 0; i < part.length; i++) {
-        updatePath(current, [part[i]].concat(path), [part[i]].concat(traversed));
+        updatePath(
+          current,
+          [part[i]].concat(path),
+          [part[i]].concat(traversedPath),
+          [prev].concat(traversedTargets),
+          notifiers
+        );
       }
       return;
     } else if (isArray && partType === "function") {
       // Ex. update('data', i => i.id === 42, 'label', l => l + ' !!!');
       for (let i = 0; i < current.length; i++) {
         if (part(current[i], i))
-          updatePath(current, [i].concat(path), ([i] as (number | string)[]).concat(traversed));
+          updatePath(
+            current,
+            [i].concat(path),
+            [i as string | number].concat(traversedPath),
+            [prev].concat(traversedTargets),
+            notifiers
+          );
       }
       return;
     } else if (isArray && partType === "object") {
       // Ex. update('data', { from: 3, to: 12, by: 2 }, 'label', l => l + ' !!!');
       const { from = 0, to = current.length - 1, by = 1 } = part;
       for (let i = from; i <= to; i += by) {
-        updatePath(current, [i].concat(path), ([i] as (number | string)[]).concat(traversed));
+        updatePath(
+          current,
+          [i].concat(path),
+          [i].concat(traversedPath),
+          [prev].concat(traversedTargets),
+          notifiers
+        );
       }
       return;
     } else if (path.length > 1) {
-      updatePath(current[part], path, [part].concat(traversed));
+      updatePath(
+        current[part],
+        path,
+        [part].concat(traversedPath),
+        [prev].concat(traversedTargets),
+        notifiers
+      );
       return;
     }
     prev = current[part];
-    traversed = [part].concat(traversed);
+    traversedPath = [part].concat(traversedPath);
   }
   let value = path[0];
   if (typeof value === "function") {
-    value = value(prev, traversed);
+    value = value(prev, traversedPath);
     if (value === prev) return;
   }
   if (part === undefined && value == undefined) return;
   value = unwrap(value);
   if (part === undefined || (isWrappable(prev) && isWrappable(value) && !Array.isArray(value))) {
     mergeState(prev, value);
-  } else setProperty(current, part, value);
+  } else setProperty(current, part, value, traversedPath, traversedTargets, notifiers);
 }
+function mergeState(state: StateNode, value: Partial<StateNode>) {
+  const keys = Object.keys(value);
+  for (let i = 0; i < keys.length; i += 1) {
+    const key = keys[i];
+    setProperty(state, key, value[key]);
+  }
+}
+type StateChangeType = "Property" | "Collection";
 
+type PropertyChangedEventArgs = {
+  newValue: any;
+  oldValue: any;
+};
+type CollectionChangedAction = "Add" | "Remove" | "Replace";
+/**
+ * @param action - Performed action
+ * @param newItems - Added or replaced items
+ * @param oldItems - Removed or replaced items
+ * @param newStartingIndex - Index of inserted items
+ * @param oldStartingIndex - Old index of inserted items
+ */
+type CollectionChangedEventArgs = {
+  action: CollectionChangedAction;
+  newItems?: any[];
+  oldItems?: any[];
+  newStartingIndex: number;
+  oldStartingIndex: number;
+};
+/**
+ * @param path - Artifacts of path to property, including arrays indices.
+ * @example ['foo', 'bar', 0, 'xyz']
+ * @param targets - Array of properties that form a path to target property.
+ * @param type - Type of change. Property or Collection.
+ * @param args - Detailed information about change.
+ */
+type StateChangedEventHandler = (
+  path: (string | number)[],
+  targets: object[],
+  type: StateChangeType,
+  args: PropertyChangedEventArgs | CollectionChangedEventArgs
+) => void;
+const Notifiers = new Map<object, StateChangedEventHandler[]>();
+/**
+ * Creates function that executes every time object or any children changes.
+ * @param target - Target to watch
+ * @param cb - Callback on target or target children change
+ */
+export function createNotifier(target: object, cb: StateChangedEventHandler) {
+  target = unwrap(target);
+  if (!Notifiers.has(target)) Notifiers.set(target, [cb]);
+  else Notifiers.get(target)!.push(cb);
+}
 type StateSetter<T> =
   | Partial<T>
   | ((
